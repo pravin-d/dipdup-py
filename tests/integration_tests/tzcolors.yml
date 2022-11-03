@@ -17,6 +17,8 @@ datasources:
   tzkt:
     kind: tzkt
     url: ${TZKT_URL:-https://api.tzkt.io}
+    http:
+      replay_path: ~/.cache/dipdup/replays
 
 templates:
 
@@ -52,3 +54,5 @@ indexes:
       datasource: tzkt
       minter: tzcolors_minter
       auction: tzcolors_auction
+
+logging: quiet

@@ -1,36 +1,57 @@
+import logging
+from collections import defaultdict
+from copy import copy
+from dataclasses import field
+from datetime import date
 from datetime import datetime
+from datetime import time
 from decimal import Decimal
 from enum import Enum
+from functools import cache
 from typing import Any
+from typing import DefaultDict
+from typing import Deque
 from typing import Dict
 from typing import Generic
+from typing import Iterable
 from typing import List
 from typing import Optional
+from typing import Set
+from typing import Tuple
 from typing import Type
 from typing import TypeVar
+from typing import cast
 
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
-from pydantic.error_wrappers import ValidationError
-from tortoise import Model
+from tortoise import BaseDBAsyncClient
+from tortoise import Model as TortoiseModel
 from tortoise import fields
-from typing_extensions import get_args
+from tortoise.expressions import Q
+from tortoise.fields import relational
+from tortoise.models import MODEL
+from tortoise.queryset import BulkCreateQuery as TortoiseBulkCreateQuery
+from tortoise.queryset import BulkUpdateQuery as TortoiseBulkUpdateQuery
+from tortoise.queryset import DeleteQuery as TortoiseDeleteQuery
+from tortoise.queryset import QuerySet as TortoiseQuerySet
+from tortoise.queryset import UpdateQuery as TortoiseUpdateQuery
 
 from dipdup.enums import IndexStatus
 from dipdup.enums import IndexType
-from dipdup.exceptions import ConfigurationError
-from dipdup.exceptions import InvalidDataError
-from dipdup.exceptions import ReindexingReason
-from dipdup.utils.database import ReversedCharEnumField
+from dipdup.enums import ReindexingReason
+from dipdup.enums import TokenStandard
+from dipdup.utils import json_dumps_decimals
 
 ParameterType = TypeVar('ParameterType', bound=BaseModel)
 StorageType = TypeVar('StorageType', bound=BaseModel)
 KeyType = TypeVar('KeyType', bound=BaseModel)
 ValueType = TypeVar('ValueType', bound=BaseModel)
+EventType = TypeVar('EventType', bound=BaseModel)
 
 
-# NOTE: typing_extensions introspection is pretty expensive
-_is_nested_dict: Dict[Type, bool] = {}
+_logger = logging.getLogger(__name__)
+
+# ===> Dataclasses
 
 
 @dataclass
@@ -43,13 +64,14 @@ class OperationData:
     timestamp: datetime
     hash: str
     counter: int
-    sender_address: str
+    sender_address: Optional[str]
     target_address: Optional[str]
     initiator_address: Optional[str]
     amount: Optional[int]
     status: str
     has_internals: Optional[bool]
-    storage: Dict[str, Any]
+    storage: Any
+    diffs: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     block: Optional[str] = None
     sender_alias: Optional[str] = None
     nonce: Optional[int] = None
@@ -61,93 +83,14 @@ class OperationData:
     originated_contract_alias: Optional[str] = None
     originated_contract_type_hash: Optional[int] = None
     originated_contract_code_hash: Optional[int] = None
-    diffs: Optional[List[Dict[str, Any]]] = None
-
-    # TODO: Refactor this class, move storage processing methods to TzktDatasource
-    def _merge_bigmapdiffs(self, storage_dict: Dict[str, Any], bigmap_name: str, array: bool) -> None:
-        """Apply big map diffs of specific path to storage"""
-        if self.diffs is None:
-            raise Exception('`bigmaps` field missing')
-
-        bigmap_key = bigmap_name.split('.')[-1]
-        for diff in self.diffs:
-            if diff['path'] != bigmap_name:
-                continue
-            if diff['action'] not in ('add_key', 'update_key'):
-                continue
-
-            key = diff['content']['key']
-            if array is True:
-                storage_dict[bigmap_key].append({'key': key, 'value': diff['content']['value']})
-            else:
-                storage_dict[bigmap_key][key] = diff['content']['value']
-
-    def _process_storage(
-        self,
-        storage_type: Type[StorageType],
-        storage: Dict[str, Any],
-        prefix: str = None,
-    ) -> None:
-        for key, field in storage_type.__fields__.items():
-            if key == '__root__':
-                continue
-
-            if field.alias:
-                key = field.alias
-
-            bigmap_name = key if prefix is None else f'{prefix}.{key}'
-
-            # NOTE: TzKT could return bigmaps as object or as array of key-value objects. We need to guess this from storage.
-            # TODO: This code should be a part of datasource module.
-            if (value := storage.get(key)) is None:
-                if not field.required:
-                    continue
-                raise ConfigurationError(f'Type `{storage_type.__name__}` is invalid: `{key}` field does not exists')
-
-            # NOTE: Pydantic bug? I have no idea how does it work, this workaround is just a guess.
-            # NOTE: `BaseModel.type_` returns incorrect value when annotation is Dict[str, bool], Dict[str, BaseModel], and possibly any other cases.
-            is_complex_type = field.type_ != field.outer_type_
-            is_nested_dict_model = _is_nested_dict.get(field.outer_type_)
-            if is_nested_dict_model is None:
-                try:
-                    get_args(field.outer_type_)[1].__fields__
-                    is_nested_dict_model = _is_nested_dict[field.outer_type_] = True
-                except Exception:
-                    is_nested_dict_model = _is_nested_dict[field.outer_type_] = False
-
-            if is_complex_type and (field.type_ == bool or is_nested_dict_model):
-                annotation = field.outer_type_
-            else:
-                annotation = field.type_
-
-            if annotation not in (int, bool) and isinstance(value, int):
-                if hasattr(annotation, '__fields__') and 'key' in annotation.__fields__ and 'value' in annotation.__fields__:
-                    storage[key] = []
-                    if self.diffs:
-                        self._merge_bigmapdiffs(storage, bigmap_name, array=True)
-                else:
-                    storage[key] = {}
-                    if self.diffs:
-                        self._merge_bigmapdiffs(storage, bigmap_name, array=False)
-            elif hasattr(annotation, '__fields__') and isinstance(storage[key], dict):
-                self._process_storage(annotation, storage[key], bigmap_name)
-
-    def get_merged_storage(self, storage_type: Type[StorageType]) -> StorageType:
-        """Merge big map diffs and deserialize raw storage into typeclass"""
-        if self.storage is None:
-            raise Exception('`storage` field missing')
-
-        self._process_storage(storage_type, self.storage, None)
-
-        try:
-            return storage_type.parse_obj(self.storage)
-        except ValidationError as e:
-            raise InvalidDataError(storage_type, self.storage, self) from e
+    originated_contract_tzips: Optional[Tuple[str, ...]] = None
+    delegate_address: Optional[str] = None
+    delegate_alias: Optional[str] = None
 
 
 @dataclass
 class Transaction(Generic[ParameterType, StorageType]):
-    """Wrapper for every transaction in handler arguments"""
+    """Wrapper for matched transaction with typed data passed to the handler"""
 
     data: OperationData
     parameter: ParameterType
@@ -156,7 +99,7 @@ class Transaction(Generic[ParameterType, StorageType]):
 
 @dataclass
 class Origination(Generic[StorageType]):
-    """Wrapper for every origination in handler arguments"""
+    """Wrapper for matched origination with typed data passed to the handler"""
 
     data: OperationData
     storage: StorageType
@@ -192,13 +135,14 @@ class BigMapData:
     contract_address: str
     path: str
     action: BigMapAction
+    active: bool
     key: Optional[Any] = None
     value: Optional[Any] = None
 
 
 @dataclass
 class BigMapDiff(Generic[KeyType, ValueType]):
-    """Wrapper for every big map diff in handler arguments"""
+    """Wrapper for matched big map diff with typed data passed to the handler"""
 
     action: BigMapAction
     data: BigMapData
@@ -208,30 +152,33 @@ class BigMapDiff(Generic[KeyType, ValueType]):
 
 @dataclass
 class BlockData:
-    """Basic structure for blocks from TzKT HTTP response"""
+    """Basic structure for blocks received from TzKT REST API"""
 
     level: int
     hash: str
     timestamp: datetime
     proto: int
-    priority: int
     validations: int
     deposit: int
     reward: int
     fees: int
     nonce_revealed: bool
+    priority: Optional[int] = None
     baker_address: Optional[str] = None
     baker_alias: Optional[str] = None
 
 
 @dataclass
 class HeadBlockData:
-    """Basic structure for head block from TzKT SignalR response"""
+    """Basic structure for head block received from TzKT SignalR API"""
 
+    chain: str
+    chain_id: str
     cycle: int
     level: int
     hash: str
     protocol: str
+    next_protocol: str
     timestamp: datetime
     voting_epoch: int
     voting_period: int
@@ -246,11 +193,12 @@ class HeadBlockData:
     quote_jpy: Decimal
     quote_krw: Decimal
     quote_eth: Decimal
+    quote_gbp: Decimal
 
 
 @dataclass
 class QuoteData:
-    """Basic structure for quotes from TzKT HTTP response"""
+    """Basic structure for quotes received from TzKT REST API"""
 
     level: int
     timestamp: datetime
@@ -261,12 +209,468 @@ class QuoteData:
     jpy: Decimal
     krw: Decimal
     eth: Decimal
+    gbp: Decimal
 
 
-class Schema(Model):
+@dataclass
+class TokenTransferData:
+    """Basic structure for token transver received from TzKT SignalR API"""
+
+    id: int
+    level: int
+    timestamp: datetime
+    tzkt_token_id: int
+    contract_address: Optional[str] = None
+    contract_alias: Optional[str] = None
+    token_id: Optional[int] = None
+    standard: Optional[TokenStandard] = None
+    metadata: Optional[Dict[str, Any]] = None
+    from_alias: Optional[str] = None
+    from_address: Optional[str] = None
+    to_alias: Optional[str] = None
+    to_address: Optional[str] = None
+    amount: Optional[int] = None
+    tzkt_transaction_id: Optional[int] = None
+    tzkt_origination_id: Optional[int] = None
+    tzkt_migration_id: Optional[int] = None
+
+
+@dataclass
+class EventData:
+    """Basic structure for events received from TzKT REST API"""
+
+    id: int
+    level: int
+    timestamp: datetime
+    tag: str
+    payload: Any | None
+    contract_address: str
+    contract_alias: Optional[str] = None
+    contract_code_hash: Optional[int] = None
+    transaction_id: Optional[int] = None
+
+
+@dataclass
+class Event(Generic[EventType]):
+    data: EventData
+    payload: EventType
+
+
+@dataclass
+class UnknownEvent:
+    data: EventData
+    payload: Any | None
+
+
+# ===> Model Versioning
+
+
+versioned_fields: DefaultDict[str, Set[str]] = defaultdict(set)
+
+
+@dataclass
+class VersionedTransaction:
+    """Metadata of currently opened versioned transaction."""
+
+    level: int
+    index: str
+    immune_tables: Set[str]
+
+
+# NOTE: Overwritten by TransactionManager.register()
+def get_transaction() -> Optional[VersionedTransaction]:
+    """Get metadata of currently opened versioned transaction if any"""
+    raise RuntimeError('TransactionManager is not registered')
+
+
+# NOTE: Overwritten by TransactionManager.register()
+def get_pending_updates() -> Deque['ModelUpdate']:
+    """Get pending model updates queue"""
+    raise RuntimeError('TransactionManager is not registered')
+
+
+class ModelUpdateAction(Enum):
+    """Mapping for actions in model update"""
+
+    INSERT = 'INSERT'
+    UPDATE = 'UPDATE'
+    DELETE = 'DELETE'
+
+
+class ModelUpdate(TortoiseModel):
+    """Model update created within versioned transactions"""
+
+    model_name = fields.CharField(256)
+    model_pk = fields.CharField(256)
+    level = fields.IntField()
+    index = fields.CharField(256)
+
+    action = fields.CharEnumField(ModelUpdateAction)
+    data: Dict[str, Any] = fields.JSONField(encoder=json_dumps_decimals, null=True)
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = 'dipdup_model_update'
+
+    @classmethod
+    def from_model(cls, model: 'Model', action: ModelUpdateAction) -> Optional['ModelUpdate']:
+        """Create model update from model instance if necessary"""
+        if not (transaction := get_transaction()):
+            return None
+        if model._meta.db_table in transaction.immune_tables:
+            return None
+
+        if action == ModelUpdateAction.INSERT:
+            data = None
+        elif action == ModelUpdateAction.UPDATE:
+            data = model.versioned_data_diff
+            if not data:
+                return None
+        elif action == ModelUpdateAction.DELETE:
+            data = model.versioned_data
+        else:
+            raise ValueError(f'Unknown action: {action}')
+
+        self = ModelUpdate(
+            model_name=model.__class__.__name__,
+            model_pk=model.pk,
+            level=transaction.level,
+            index=transaction.index,
+            action=action,
+            data=data,
+        )
+        _logger.debug(
+            'Saving %s(%s) %s: %s',
+            self.model_name,
+            self.model_pk,
+            self.action.value,
+            data,
+        )
+        return self
+
+    async def revert(self, model: Type[TortoiseModel]) -> None:
+        """Revert a single model update"""
+        data = copy(self.data)
+        # NOTE: Deserialize non-JSON types
+        if data:
+            for key, field_ in model._meta.fields_map.items():
+                # NOTE: Restore deleted models with old PK
+                if field_.pk and self.action == ModelUpdateAction.DELETE:
+                    data[key] = self.model_pk
+                    continue
+
+                value = data.get(key)
+                if value is None:
+                    continue
+
+                if isinstance(field_, fields.DecimalField):
+                    data[key] = Decimal(value)
+                elif isinstance(field_, fields.DatetimeField):
+                    data[key] = datetime.fromisoformat(value)
+                elif isinstance(field_, fields.DateField):
+                    data[key] = date.fromisoformat(value)
+                elif isinstance(field_, fields.TimeField):
+                    data[key] = time.fromisoformat(value)
+
+                # TODO: There may be more non-JSON-deserializable fields
+
+        _logger.debug(
+            'Reverting %s(%s) %s: %s',
+            self.model_name,
+            self.model_pk,
+            self.action.value,
+            data,
+        )
+        # NOTE: Do not version rollbacks, use unpatched querysets
+        if self.action == ModelUpdateAction.INSERT:
+            await TortoiseQuerySet(model).filter(pk=self.model_pk).delete()
+        elif self.action == ModelUpdateAction.UPDATE:
+            await TortoiseQuerySet(model).filter(pk=self.model_pk).update(**data)
+        elif self.action == ModelUpdateAction.DELETE:
+            await model.create(**data)
+
+        await self.delete()
+
+
+class UpdateQuery(TortoiseUpdateQuery):
+    def __init__(
+        self,
+        model: Type[TortoiseModel],
+        update_kwargs: Dict[str, Any],
+        db: BaseDBAsyncClient,
+        q_objects: List[Q],
+        annotations: Dict[str, Any],
+        custom_filters: Dict[str, Dict[str, Any]],
+        limit: Optional[int],
+        orderings: List[Tuple[str, str]],
+        filter_queryset: TortoiseQuerySet,
+    ) -> None:
+        super().__init__(
+            model,
+            update_kwargs,
+            db,
+            q_objects,
+            annotations,
+            custom_filters,
+            limit,
+            orderings,
+        )
+        self.filter_queryset = filter_queryset
+
+    async def _execute(self) -> int:
+        _logger.debug('Prefetching query models: %s', self.filter_queryset)
+        models = await self.filter_queryset
+        _logger.debug('Got %s', len(models))
+
+        for model in models:
+            model._set_kwargs(self.update_kwargs)
+            if update := ModelUpdate.from_model(model, ModelUpdateAction.UPDATE):
+                get_pending_updates().append(update)
+
+        return await super()._execute()
+
+
+class DeleteQuery(TortoiseDeleteQuery):
+    def __init__(
+        self,
+        model: Type[TortoiseModel],
+        db: BaseDBAsyncClient,
+        q_objects: List[Q],
+        annotations: Dict[str, Any],
+        custom_filters: Dict[str, Dict[str, Any]],
+        limit: Optional[int],
+        orderings: List[Tuple[str, str]],
+        filter_queryset: TortoiseQuerySet,
+    ) -> None:
+        super().__init__(model, db, q_objects, annotations, custom_filters, limit, orderings)
+        self.filter_queryset = filter_queryset
+
+    async def _execute(self) -> int:
+        _logger.debug('Prefetching query models: %s', self.filter_queryset)
+        models = await self.filter_queryset
+        _logger.debug('Got %s', len(models))
+
+        for model in models:
+            if update := ModelUpdate.from_model(model, ModelUpdateAction.DELETE):
+                get_pending_updates().append(update)
+
+        return await super()._execute()
+
+
+class BulkUpdateQuery(TortoiseBulkUpdateQuery):
+    async def _execute(self) -> int:
+        for model in self.objects:
+            if update := ModelUpdate.from_model(
+                cast(Model, model),
+                ModelUpdateAction.UPDATE,
+            ):
+                get_pending_updates().append(update)
+
+        return await super()._execute()
+
+
+class BulkCreateQuery(TortoiseBulkCreateQuery):
+    async def _execute(self) -> List[MODEL]:
+        for model in self.objects:
+            if update := ModelUpdate.from_model(
+                cast(Model, model),
+                ModelUpdateAction.INSERT,
+            ):
+                get_pending_updates().append(update)
+
+        return await super()._execute()
+
+
+class QuerySet(TortoiseQuerySet):
+    def update(self, **kwargs: Any) -> UpdateQuery:
+        return UpdateQuery(
+            db=self._db,
+            model=self.model,
+            update_kwargs=kwargs,
+            q_objects=self._q_objects,
+            annotations=self._annotations,
+            custom_filters=self._custom_filters,
+            limit=self._limit,
+            orderings=self._orderings,
+            filter_queryset=self,
+        )
+
+    def delete(self) -> DeleteQuery:
+        return DeleteQuery(
+            db=self._db,
+            model=self.model,
+            q_objects=self._q_objects,
+            annotations=self._annotations,
+            custom_filters=self._custom_filters,
+            limit=self._limit,
+            orderings=self._orderings,
+            filter_queryset=self,
+        )
+
+
+@cache
+def get_versioned_fields(model: Type['Model']) -> Set[str]:
+    field_names: Set[str] = set()
+    field_keys = model._meta.db_fields.union(model._meta.fk_fields)
+
+    for key, field_ in model._meta.fields_map.items():
+        if key not in field_keys:
+            continue
+        if field_.pk:
+            continue
+        elif isinstance(field_, relational.ForeignKeyFieldInstance):
+            field_names.add(f'{key}_id')
+        else:
+            field_names.add(key)
+
+    return field_names
+
+
+class Model(TortoiseModel):
+    """Base class for DipDup project models"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._original_versioned_data = self.versioned_data
+
+    @classmethod
+    def _init_from_db(cls, **kwargs: Any) -> 'Model':
+        model = super()._init_from_db(**kwargs)
+        model._original_versioned_data = model.versioned_data
+        return model
+
+    @property
+    def original_versioned_data(self) -> Dict[str, Any]:
+        """Get versioned data of the model at the time of creation"""
+        return self._original_versioned_data
+
+    @property
+    def versioned_data(self) -> Dict[str, Any]:
+        """Get versioned data of the model at the current time"""
+        return {name: getattr(self, name) for name in get_versioned_fields(self.__class__)}
+
+    @property
+    def versioned_data_diff(self) -> Dict[str, Any]:
+        """Get versioned data of the model changed since creation"""
+        data = {}
+        for key, value in self.original_versioned_data.items():
+            if value != self.versioned_data[key]:
+                data[key] = value
+        return data
+
+    # NOTE: Do not touch docstrings below this line to preserve Tortoise ones
+    async def delete(
+        self,
+        using_db: Optional[BaseDBAsyncClient] = None,
+    ) -> None:
+        await super().delete(using_db=using_db)
+
+        if update := ModelUpdate.from_model(self, ModelUpdateAction.DELETE):
+            get_pending_updates().append(update)
+
+    async def save(
+        self,
+        using_db: Optional[BaseDBAsyncClient] = None,
+        update_fields: Optional[Iterable[str]] = None,
+        force_create: bool = False,
+        force_update: bool = False,
+    ) -> None:
+        action = ModelUpdateAction.UPDATE if self._saved_in_db else ModelUpdateAction.INSERT
+        await super().save(
+            using_db=using_db,
+            update_fields=update_fields,
+            force_create=force_create,
+            force_update=force_update,
+        )
+
+        if update := ModelUpdate.from_model(self, action):
+            get_pending_updates().append(update)
+
+    @classmethod
+    def filter(cls, *args: Any, **kwargs: Any) -> TortoiseQuerySet:
+        return QuerySet(cls).filter(*args, **kwargs)
+
+    @classmethod
+    async def create(
+        cls: Type['ModelT'],
+        using_db: Optional[BaseDBAsyncClient] = None,
+        **kwargs: Any,
+    ) -> 'ModelT':
+        instance = cls(**kwargs)
+        instance._saved_in_db = False
+        db = using_db or cls._choose_db(True)
+        await instance.save(using_db=db, force_create=True)
+        return instance
+
+    @classmethod
+    def bulk_create(
+        cls: Type['Model'],
+        objects: Iterable['Model'],
+        batch_size: Optional[int] = None,
+        ignore_conflicts: bool = False,
+        update_fields: Optional[Iterable[str]] = None,
+        on_conflict: Optional[Iterable[str]] = None,
+        using_db: Optional[BaseDBAsyncClient] = None,
+    ) -> BulkCreateQuery:
+        if ignore_conflicts and update_fields:
+            raise ValueError(
+                'ignore_conflicts and update_fields are mutually exclusive.',
+            )
+        if not ignore_conflicts:
+            if (update_fields and not on_conflict) or (on_conflict and not update_fields):
+                raise ValueError('update_fields and on_conflict need set in same time.')
+
+        return BulkCreateQuery(
+            db=using_db or cls._choose_db(True),
+            model=cls,
+            objects=objects,
+            batch_size=batch_size,
+            ignore_conflicts=ignore_conflicts,
+            update_fields=update_fields,
+            on_conflict=on_conflict,
+        )
+
+    @classmethod
+    def bulk_update(
+        cls: Type['Model'],
+        objects: Iterable['Model'],
+        fields: Iterable[str],
+        batch_size: Optional[int] = None,
+        using_db: Optional[BaseDBAsyncClient] = None,
+    ) -> BulkUpdateQuery:
+        if any(obj.pk is None for obj in objects):
+            raise ValueError('All bulk_update() objects must have a primary key set.')
+
+        self = QuerySet(cls)
+        return BulkUpdateQuery(  # type:ignore
+            db=self._db,
+            model=self.model,
+            q_objects=self._q_objects,
+            annotations=self._annotations,
+            custom_filters=self._custom_filters,
+            limit=self._limit,
+            orderings=self._orderings,
+            objects=objects,
+            fields=fields,
+            batch_size=batch_size,
+        )
+
+    class Meta:
+        abstract = True
+
+
+ModelT = TypeVar('ModelT', bound=Model)
+
+
+# ===> Built-in Models (not versioned)
+
+
+class Schema(TortoiseModel):
     name = fields.CharField(256, pk=True)
     hash = fields.CharField(256)
-    reindex = ReversedCharEnumField(ReindexingReason, max_length=40, null=True)
+    reindex = fields.CharEnumField(ReindexingReason, max_length=40, null=True)
 
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
@@ -275,7 +679,7 @@ class Schema(Model):
         table = 'dipdup_schema'
 
 
-class Head(Model):
+class Head(TortoiseModel):
     name = fields.CharField(256, pk=True)
     level = fields.IntField()
     hash = fields.CharField(64)
@@ -288,14 +692,14 @@ class Head(Model):
         table = 'dipdup_head'
 
 
-class Index(Model):
+class Index(TortoiseModel):
     name = fields.CharField(256, pk=True)
     type = fields.CharEnumField(IndexType)
     status = fields.CharEnumField(IndexStatus, default=IndexStatus.NEW)
 
     config_hash = fields.CharField(256)
     template = fields.CharField(256, null=True)
-    template_values = fields.JSONField(null=True)
+    template_values: Dict[str, Any] = fields.JSONField(null=True)
 
     level = fields.IntField(default=0)
 
@@ -308,14 +712,14 @@ class Index(Model):
         level: Optional[int] = None,
     ) -> None:
         self.status = status or self.status
-        self.level = level or self.level  # type: ignore
+        self.level = level or self.level
         await self.save()
 
     class Meta:
         table = 'dipdup_index'
 
 
-class Contract(Model):
+class Contract(TortoiseModel):
     name = fields.CharField(256, pk=True)
     address = fields.CharField(256)
     typename = fields.CharField(256, null=True)
@@ -325,3 +729,35 @@ class Contract(Model):
 
     class Meta:
         table = 'dipdup_contract'
+
+
+# ===> Built-in Models (versioned)
+
+
+class ContractMetadata(Model):
+    network = fields.CharField(51)
+    contract = fields.CharField(36)
+    metadata = fields.JSONField()
+    update_id = fields.IntField()
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = 'dipdup_contract_metadata'
+        unique_together = ('network', 'contract')
+
+
+class TokenMetadata(Model):
+    network = fields.CharField(51)
+    contract = fields.CharField(36)
+    token_id = fields.TextField()
+    metadata = fields.JSONField()
+    update_id = fields.IntField()
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = 'dipdup_token_metadata'
+        unique_together = ('network', 'contract', 'token_id')

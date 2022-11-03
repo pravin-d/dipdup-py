@@ -4,53 +4,77 @@ import hashlib
 import importlib
 import logging
 from contextlib import asynccontextmanager
-from enum import Enum
-from os.path import dirname
-from os.path import join
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from typing import AsyncIterator
+from typing import Dict
+from typing import Iterable
 from typing import Iterator
 from typing import Optional
+from typing import Set
 from typing import Tuple
 from typing import Type
 from typing import Union
 
-from tortoise import Model
+import sqlparse  # type: ignore
+from tortoise import ForeignKeyFieldInstance
+from tortoise import Model as TortoiseModel
+from tortoise import ModuleType
 from tortoise import Tortoise
+from tortoise import connections
 from tortoise.backends.asyncpg.client import AsyncpgDBClient
 from tortoise.backends.base.client import BaseDBAsyncClient
-from tortoise.backends.base.client import TransactionContext
 from tortoise.backends.sqlite.client import SqliteClient
 from tortoise.fields import DecimalField
-from tortoise.fields.data import CharEnumType
-from tortoise.fields.data import CharField
-from tortoise.transactions import in_transaction
 from tortoise.utils import get_schema_sql
 
-from dipdup.enums import ReversedEnum
-from dipdup.exceptions import DatabaseConfigurationError
+from dipdup.exceptions import FeatureAvailabilityError
+from dipdup.exceptions import InvalidModelsError
+from dipdup.utils import iter_files
 from dipdup.utils import pascal_to_snake
 
 _logger = logging.getLogger('dipdup.database')
-_truncate_schema_sql = Path(join(dirname(__file__), 'truncate_schema.sql')).read_text()
+_truncate_schema_path = Path(__file__).parent / 'truncate_schema.sql'
+
+DEFAULT_CONNECTION_NAME = 'default'
+
+
+def get_connection() -> BaseDBAsyncClient:
+    return connections.get(DEFAULT_CONNECTION_NAME)
+
+
+def set_connection(conn: BaseDBAsyncClient) -> None:
+    connections.set(DEFAULT_CONNECTION_NAME, conn)
 
 
 @asynccontextmanager
 async def tortoise_wrapper(url: str, models: Optional[str] = None, timeout: int = 60) -> AsyncIterator:
     """Initialize Tortoise with internal and project models, close connections when done"""
-    modules = {'int_models': ['dipdup.models']}
+    model_modules: Dict[str, Iterable[Union[str, ModuleType]]] = {
+        'int_models': ['dipdup.models'],
+    }
     if models:
-        modules['models'] = [models]
+        if not models.endswith('.models'):
+            models += '.models'
+        model_modules['models'] = [models]
+
+    # NOTE: Must be called before entering Tortoise context
+    prepare_models(models)
+
     try:
         for attempt in range(timeout):
             try:
                 await Tortoise.init(
                     db_url=url,
-                    modules=modules,  # type: ignore
+                    modules=model_modules,
                 )
-            except (OSError, ConnectionRefusedError):
-                _logger.warning('Can\'t establish database connection, attempt %s/%s', attempt, timeout)
+
+                conn = get_connection()
+                await conn.execute_query('SELECT 1')
+            # FIXME: Logging
+            except OSError:
+                _logger.warning("Can't establish database connection, attempt %s/%s", attempt, timeout)
                 if attempt == timeout - 1:
                     raise
                 await asyncio.sleep(1)
@@ -61,62 +85,34 @@ async def tortoise_wrapper(url: str, models: Optional[str] = None, timeout: int 
         await Tortoise.close_connections()
 
 
-@asynccontextmanager
-async def in_global_transaction():
-    """Enforce using transaction for all queries inside wrapped block. Works for a single DB only."""
-    if list(Tortoise._connections.keys()) != ['default']:
-        raise RuntimeError('`in_global_transaction` wrapper works only with a single DB connection')
-
-    async with in_transaction() as conn:
-        conn: TransactionContext
-        original_conn = Tortoise._connections['default']
-        Tortoise._connections['default'] = conn
-
-        if isinstance(original_conn, SqliteClient):
-            conn.filename = original_conn.filename
-            conn.pragmas = original_conn.pragmas
-        elif isinstance(original_conn, AsyncpgDBClient):
-            conn._pool = original_conn._pool
-            conn._template = original_conn._template
-        else:
-            raise NotImplementedError
-
-        yield
-
-    Tortoise._connections['default'] = original_conn
-
-
 def is_model_class(obj: Any) -> bool:
     """Is subclass of tortoise.Model, but not the base class"""
-    return isinstance(obj, type) and issubclass(obj, Model) and obj != Model and not getattr(obj.Meta, 'abstract', False)
+    from dipdup.models import Model
+
+    return isinstance(obj, type) and issubclass(obj, TortoiseModel) and obj not in (TortoiseModel, Model)
 
 
-def iter_models(package: str) -> Iterator[Tuple[str, Type[Model]]]:
+def iter_models(package: Optional[str]) -> Iterator[Tuple[str, Type[TortoiseModel]]]:
     """Iterate over built-in and project's models"""
-    dipdup_models = importlib.import_module('dipdup.models')
-    package_models = importlib.import_module(f'{package}.models')
+    modules = [
+        ('int_models', importlib.import_module('dipdup.models')),
+    ]
 
-    for models in (dipdup_models, package_models):
-        for attr in dir(models):
-            model = getattr(models, attr)
-            if is_model_class(model):
-                app = 'int_models' if models.__name__ == 'dipdup.models' else 'models'
-                yield app, model
+    if package:
+        if not package.endswith('.models'):
+            package += '.models'
+        modules.append(
+            ('models', importlib.import_module(package)),
+        )
 
+    for app, module in modules:
+        for attr in dir(module):
+            if attr.startswith('_'):
+                continue
 
-def set_decimal_context(package: str) -> None:
-    """Adjust system decimal context to match database precision"""
-    context = decimal.getcontext()
-    prec = context.prec
-    for _, model in iter_models(package):
-        for field in model._meta.fields_map.values():
-            if isinstance(field, DecimalField):
-                context.prec = max(context.prec, field.max_digits + field.max_digits)
-    if prec < context.prec:
-        _logger.warning('Decimal context precision has been updated: %s -> %s', prec, context.prec)
-        # NOTE: DefaultContext used for new threads
-        decimal.DefaultContext.prec = context.prec
-        decimal.setcontext(context)
+            attr_value = getattr(module, attr)
+            if is_model_class(attr_value):
+                yield app, attr_value
 
 
 def get_schema_hash(conn: BaseDBAsyncClient) -> str:
@@ -127,21 +123,34 @@ def get_schema_hash(conn: BaseDBAsyncClient) -> str:
     return hashlib.sha256(processed_schema_sql).hexdigest()
 
 
-async def set_schema(conn: BaseDBAsyncClient, name: str) -> None:
-    """Set schema for the connection"""
-    if isinstance(conn, SqliteClient):
-        raise NotImplementedError
-
-    await conn.execute_script(f'SET search_path TO {name}')
-
-
 async def create_schema(conn: BaseDBAsyncClient, name: str) -> None:
     if isinstance(conn, SqliteClient):
         raise NotImplementedError
 
     await conn.execute_script(f'CREATE SCHEMA IF NOT EXISTS {name}')
-    # FIXME: Oh...
-    await conn.execute_script(_truncate_schema_sql)
+    # NOTE: Recreate `truncate_schema` function on fresh schema
+    await conn.execute_script(_truncate_schema_path.read_text())
+
+
+async def execute_sql_scripts(conn: BaseDBAsyncClient, path: str | Path) -> None:
+    if isinstance(path, str):
+        path = Path(path)
+
+    supported = isinstance(conn, AsyncpgDBClient)
+
+    for file in iter_files(path, '.sql'):
+        if not supported:
+            raise FeatureAvailabilityError(
+                feature='sql_scripts',
+                reason='SQL scripts are not supported for SQLite database.',
+            )
+
+        _logger.info('Executing `%s`', file.name)
+        sql = file.read()
+        for statement in sqlparse.split(sql):
+            # NOTE: Ignore empty statements
+            with suppress(AttributeError):
+                await conn.execute_script(statement)
 
 
 async def generate_schema(conn: BaseDBAsyncClient, name: str) -> None:
@@ -149,8 +158,11 @@ async def generate_schema(conn: BaseDBAsyncClient, name: str) -> None:
         await Tortoise.generate_schemas()
     elif isinstance(conn, AsyncpgDBClient):
         await create_schema(conn, name)
-        await set_schema(conn, name)
         await Tortoise.generate_schemas()
+
+        # NOTE: Apply built-in scripts before project ones
+        sql_path = Path(__file__).parent.parent / 'sql' / 'on_reindex'
+        await execute_sql_scripts(conn, sql_path)
     else:
         raise NotImplementedError
 
@@ -159,26 +171,33 @@ async def truncate_schema(conn: BaseDBAsyncClient, name: str) -> None:
     if isinstance(conn, SqliteClient):
         raise NotImplementedError
 
-    await conn.execute_script(_truncate_schema_sql)
+    await conn.execute_script(_truncate_schema_path.read_text())
     await conn.execute_script(f"SELECT truncate_schema('{name}')")
 
 
-async def wipe_schema(conn: BaseDBAsyncClient, name: str, immune_tables: Tuple[str, ...]) -> None:
+async def wipe_schema(
+    conn: BaseDBAsyncClient,
+    schema_name: str,
+    immune_tables: Set[str],
+) -> None:
+    """Truncate schema preserving immune tables. Executes in a transaction"""
     if isinstance(conn, SqliteClient):
         raise NotImplementedError
 
-    immune_schema_name = f'{name}_immune'
-    if immune_tables:
-        await create_schema(conn, immune_schema_name)
-        for table in immune_tables:
-            await move_table(conn, table, name, immune_schema_name)
+    immune_schema_name = f'{schema_name}_immune'
 
-    await truncate_schema(conn, name)
+    async with conn._in_transaction() as conn:
+        if immune_tables:
+            await create_schema(conn, immune_schema_name)
+            for table in immune_tables:
+                await move_table(conn, table, schema_name, immune_schema_name)
 
-    if immune_tables:
-        for table in immune_tables:
-            await move_table(conn, table, immune_schema_name, name)
-        await drop_schema(conn, immune_schema_name)
+        await truncate_schema(conn, schema_name)
+
+        if immune_tables:
+            for table in immune_tables:
+                await move_table(conn, table, immune_schema_name, schema_name)
+            await drop_schema(conn, immune_schema_name)
 
 
 async def drop_schema(conn: BaseDBAsyncClient, name: str) -> None:
@@ -196,74 +215,82 @@ async def move_table(conn: BaseDBAsyncClient, name: str, schema: str, new_schema
     await conn.execute_script(f'ALTER TABLE {schema}.{name} SET SCHEMA {new_schema}')
 
 
-def prepare_models(package: str) -> None:
-    for _, model in iter_models(package):
+def prepare_models(package: Optional[str]) -> None:
+    """Prepare TortoiseORM models to use with DipDup.
+    Generate missing table names, validate models, increase decimal precision if needed.
+    """
+    # NOTE: Circular imports
+    import dipdup.models
+
+    db_tables: Set[str] = set()
+    decimal_context = decimal.getcontext()
+    prec = decimal_context.prec
+
+    for app, model in iter_models(package):
+        # NOTE: Enforce our class for user models
+        if app == 'models' and not issubclass(model, dipdup.models.Model):
+            raise InvalidModelsError(
+                'Project models must be subclassed from `dipdup.models.Model`.'
+                '\n\n'
+                'Replace `from tortoise import Model` import with `from dipdup.models import Model`.',
+                model,
+            )
+
         # NOTE: Generate missing table names before Tortoise does
-        model._meta.db_table = model._meta.db_table or pascal_to_snake(model.__name__)
+        if not model._meta.db_table:
+            model._meta.db_table = pascal_to_snake(model.__name__)
 
+        if model._meta.db_table not in db_tables:
+            db_tables.add(model._meta.db_table)
+        else:
+            raise InvalidModelsError(
+                'Table name is duplicated or reserved. Make sure that all models have unique table names.',
+                model,
+            )
 
-def validate_models(package: str) -> None:
-    """Check project's models for common mistakes"""
-    for _, model in iter_models(package):
+        # NOTE: Enforce tables in snake_case
         table_name = model._meta.db_table
-
         if table_name != pascal_to_snake(table_name):
-            raise DatabaseConfigurationError('Table name must be in snake_case', model)
+            raise InvalidModelsError(
+                'Table name must be in snake_case.',
+                model,
+            )
 
         for field in model._meta.fields_map.values():
+            # NOTE: Enforce fields in snake_case
             field_name = field.model_field_name
-
             if field_name != pascal_to_snake(field_name):
-                raise DatabaseConfigurationError('Model fields must be in snake_case', model)
+                raise InvalidModelsError(
+                    'Model fields must be in snake_case.',
+                    model,
+                    field_name,
+                )
 
-            # NOTE: Leads to GraphQL issues
+            # NOTE: Enforce unique field names to avoid GraphQL issues
             if field_name == table_name:
-                raise DatabaseConfigurationError('Model fields must differ from table name', model)
+                raise InvalidModelsError(
+                    'Model field names must differ from table name.',
+                    model,
+                    field_name,
+                )
 
+            # NOTE: The same for backward relations
+            if isinstance(field, ForeignKeyFieldInstance) and field.related_name == table_name:
+                raise InvalidModelsError(
+                    'Model field names must differ from table name.',
+                    model,
+                    f'related_name={field.related_name}',
+                )
 
-class ReversedCharEnumFieldInstance(CharField):
-    def __init__(
-        self,
-        enum_type: Type[ReversedEnum],
-        description: Optional[str] = None,
-        max_length: int = 0,
-        **kwargs: Any,
-    ) -> None:
+            # NOTE: Increase decimal precision if needed
+            if isinstance(field, DecimalField):
+                prec = max(prec, field.max_digits)
 
-        # Automatic description for the field if not specified by the user
-        if description is None:
-            description = "\n".join([f"{e.name}: {str(e.value)}" for e in enum_type])[:2048]
+    # NOTE: Set new decimal precision
+    if decimal_context.prec < prec:
+        _logger.warning('Decimal context precision has been updated: %s -> %s', decimal_context.prec, prec)
+        decimal_context.prec = prec
 
-        # Automatic CharField max_length
-        if max_length == 0:
-            for item in enum_type:
-                item_len = len(str(item.name))
-                if item_len > max_length:
-                    max_length = item_len
-
-        super().__init__(description=description, max_length=max_length, **kwargs)
-        self.enum_type = enum_type
-
-    def to_python_value(self, value: Union[Enum, str, None]) -> Union[Enum, None]:
-        if value is None:
-            return None
-        if isinstance(value, Enum):
-            return value
-        return self.enum_type[value]
-
-    def to_db_value(self, value: Optional[Any], instance: Union[Type[Model], Model]) -> Union[str, None]:
-        if value is None:
-            return None
-        if isinstance(value, Enum):
-            return value.name
-        return self.enum_type[value].name
-
-
-def ReversedCharEnumField(  # pylint: disable=invalid-name
-    enum_type: Type[CharEnumType],
-    description: Optional[str] = None,
-    max_length: int = 0,
-    **kwargs: Any,
-) -> CharEnumType:
-
-    return ReversedCharEnumFieldInstance(enum_type, description, max_length, **kwargs)  # type: ignore
+        # NOTE: DefaultContext is used for new threads
+        decimal.DefaultContext.prec = prec
+        decimal.setcontext(decimal_context)

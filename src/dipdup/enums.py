@@ -1,21 +1,40 @@
 from enum import Enum
-from typing import Dict
 
 
-class ReversedEnum(Enum):
-    ...
+class LoggingValues(Enum):
+    """Enum for `logging` field values."""
+
+    default = 'default'
+    quiet = 'quiet'
+    verbose = 'verbose'
 
 
 class MessageType(Enum):
     operation = 'operation'
     big_map = 'big_map'
     head = 'head'
+    token_transfer = 'token_transfer'
+    event = 'event'
 
 
 class IndexType(Enum):
     operation = 'operation'
     big_map = 'big_map'
     head = 'head'
+    token_transfer = 'token_transfer'
+    event = 'event'
+
+
+class OperationType(Enum):
+    transaction = 'transaction'
+    origination = 'origination'
+    migration = 'migration'
+
+
+class SkipHistory(Enum):
+    never = 'never'
+    once = 'once'
+    always = 'always'
 
 
 class IndexStatus(Enum):
@@ -23,20 +42,12 @@ class IndexStatus(Enum):
     SYNCING = 'SYNCING'
     REALTIME = 'REALTIME'
     ROLLBACK = 'ROLLBACK'
+    # TODO: Rename to DISABLED or something one day
     ONESHOT = 'ONESHOT'
 
 
-class ReindexingReason(ReversedEnum):
-    MANUAL = 'triggered manually from callback'
-    MIGRATION = 'applied migration requires reindexing'
-    ROLLBACK = 'reorg message received and can\'t be processed'
-    CONFIG_HASH_MISMATCH = 'index config has been modified'
-    SCHEMA_HASH_MISMATCH = 'database schema has been modified'
-    BLOCK_HASH_MISMATCH = 'block hash mismatch, missed rollback when DipDup was stopped'
-    MISSING_INDEX_TEMPLATE = 'index template is missing, can\'t restore index state'
-
-
-class ReindexingReasonC(Enum):
+# NOTE: Used as a key in config, must inherit from str
+class ReindexingReason(str, Enum):
     manual = 'manual'
     migration = 'migration'
     rollback = 'rollback'
@@ -44,26 +55,12 @@ class ReindexingReasonC(Enum):
     schema_modified = 'schema_modified'
 
 
-class ReindexingAction(ReversedEnum):
+class ReindexingAction(Enum):
     exception = 'exception'
     wipe = 'wipe'
     ignore = 'ignore'
 
 
-reason_to_reasonc: Dict[ReindexingReason, ReindexingReasonC] = {
-    ReindexingReason.MANUAL: ReindexingReasonC.manual,
-    ReindexingReason.MIGRATION: ReindexingReasonC.migration,
-    ReindexingReason.ROLLBACK: ReindexingReasonC.rollback,
-    ReindexingReason.CONFIG_HASH_MISMATCH: ReindexingReasonC.config_modified,
-    ReindexingReason.SCHEMA_HASH_MISMATCH: ReindexingReasonC.schema_modified,
-    ReindexingReason.BLOCK_HASH_MISMATCH: ReindexingReasonC.rollback,
-    ReindexingReason.MISSING_INDEX_TEMPLATE: ReindexingReasonC.config_modified,
-}
-
-reasonc_to_reason: Dict[ReindexingReasonC, ReindexingReason] = {
-    ReindexingReasonC.manual: ReindexingReason.MANUAL,
-    ReindexingReasonC.migration: ReindexingReason.MIGRATION,
-    ReindexingReasonC.rollback: ReindexingReason.ROLLBACK,
-    ReindexingReasonC.config_modified: ReindexingReason.CONFIG_HASH_MISMATCH,
-    ReindexingReasonC.schema_modified: ReindexingReason.SCHEMA_HASH_MISMATCH,
-}
+class TokenStandard(Enum):
+    FA12 = 'fa1.2'
+    FA2 = 'fa2'

@@ -19,7 +19,6 @@ API_URL = 'https://api.pro.coinbase.com'
 
 class CoinbaseDatasource(Datasource):
     _default_http_config = HTTPConfig(
-        cache=True,
         retry_count=3,
         retry_sleep=1,
         ratelimit_rate=10,
@@ -34,15 +33,17 @@ class CoinbaseDatasource(Datasource):
         pass
 
     async def get_oracle_prices(self) -> Dict[str, Any]:
-        return await self._http.request(
+        return await self.request(
             'get',
             url='oracle',
         )
 
-    async def get_candles(self, since: datetime, until: datetime, interval: CandleInterval, ticker: str = 'XTZ-USD') -> List[CandleData]:
+    async def get_candles(
+        self, since: datetime, until: datetime, interval: CandleInterval, ticker: str = 'XTZ-USD'
+    ) -> List[CandleData]:
         candles = []
         for _since, _until in self._split_candle_requests(since, until, interval):
-            candles_json = await self._http.request(
+            candles_json = await self.request(
                 'get',
                 url=f'products/{ticker}/candles',
                 params={
@@ -54,7 +55,9 @@ class CoinbaseDatasource(Datasource):
             candles += [CandleData.from_json(c) for c in candles_json]
         return sorted(candles, key=lambda c: c.timestamp)
 
-    def _split_candle_requests(self, since: datetime, until: datetime, interval: CandleInterval) -> List[Tuple[datetime, datetime]]:
+    def _split_candle_requests(
+        self, since: datetime, until: datetime, interval: CandleInterval
+    ) -> List[Tuple[datetime, datetime]]:
         request_interval_limit = timedelta(seconds=interval.seconds * CANDLES_REQUEST_LIMIT)
         request_intervals = []
         while since + request_interval_limit < until:

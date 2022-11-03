@@ -1,7 +1,6 @@
 from contextlib import AsyncExitStack
 from datetime import datetime
-from os.path import dirname
-from os.path import join
+from pathlib import Path
 from unittest import IsolatedAsyncioTestCase
 
 from pytz import UTC
@@ -13,37 +12,35 @@ from dipdup.enums import IndexStatus
 from dipdup.enums import IndexType
 from dipdup.exceptions import ReindexingRequiredError
 from dipdup.models import Index
-from dipdup.test import create_test_dipdup
+from tests.test_dipdup import create_test_dipdup
 
 
 async def _create_index(hash_: str) -> None:
     await Index.create(
-        **{
-            'level': 1365000,
-            'name': 'hen_mainnet',
-            'template': None,
-            'config_hash': hash_,
-            'created_at': datetime(2021, 10, 8, 18, 43, 35, 744412, tzinfo=UTC),
-            'template_values': {},
-            'status': IndexStatus.NEW,
-            'updated_at': datetime(2021, 10, 8, 18, 43, 35, 744449, tzinfo=UTC),
-            'type': IndexType.operation,
-        }
+        level=1365000,
+        name='hen_mainnet',
+        template=None,
+        config_hash=hash_,
+        created_at=datetime(2021, 10, 8, 18, 43, 35, 744412, tzinfo=UTC),
+        template_values={},
+        status=IndexStatus.NEW,
+        updated_at=datetime(2021, 10, 8, 18, 43, 35, 744449, tzinfo=UTC),
+        type=IndexType.operation,
     )
 
 
 async def spawn_index(dispatcher: IndexDispatcher, name: str) -> None:
-    await dispatcher._ctx.spawn_index(name)
+    await dispatcher._ctx._spawn_index(name)
     dispatcher._indexes[name] = pending_indexes.pop()
 
 
 class IndexStateTest(IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         name = 'hic_et_nunc.yml'
-        config_path = join(dirname(__file__), '..', 'integration_tests', name)
+        config_path = Path(__file__).parent.parent / 'integration_tests' / name
         self.config = DipDupConfig.load([config_path])
 
-        self.new_hash = '1ac841facf593f2ef2de2e747c7b547d4a05891a8633c4a238ad73c28a421f71'
+        self.new_hash = '98858ec743f2c84ef9505ccefa2235fc6bb9e9b209b14b2028dd4650eaf96756'
 
     async def test_first_run(self) -> None:
         async with AsyncExitStack() as stack:

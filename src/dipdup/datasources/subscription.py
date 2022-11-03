@@ -1,40 +1,20 @@
 import logging
-from abc import ABC
+from abc import abstractmethod
+from typing import Any
 from typing import Dict
+from typing import Optional
 from typing import Set
-
-from pydantic.dataclasses import dataclass
-from tortoise import Optional
 
 _logger = logging.getLogger('dipdup.datasource')
 
 
-class Subscription(ABC):
-    ...
+class Subscription:
+    type: str
+    method: str
 
-
-@dataclass(frozen=True)
-class HeadSubscription(Subscription):
-    type: str = 'head'
-
-
-@dataclass(frozen=True)
-class OriginationSubscription(Subscription):
-    type: str = 'origination'
-
-
-@dataclass(frozen=True)
-class TransactionSubscription(Subscription):
-    type: str = 'transaction'
-    address: Optional[str] = None
-
-
-# TODO: Add `ptr` and `tags` filters
-@dataclass(frozen=True)
-class BigMapSubscription(Subscription):
-    type: str = 'big_map'
-    address: Optional[str] = None
-    path: Optional[str] = None
+    @abstractmethod
+    def get_request(self) -> Any:
+        ...
 
 
 class SubscriptionManager:
@@ -44,13 +24,10 @@ class SubscriptionManager:
 
     @property
     def missing_subscriptions(self) -> Set[Subscription]:
-        return set(k for k, v in self._subscriptions.items() if k is not None and v is None)
+        return {k for k, v in self._subscriptions.items() if k is not None and v is None}
 
     def add(self, subscription: Subscription) -> None:
-        if subscription in self._subscriptions:
-            if not self._merge_subscriptions:
-                _logger.warning(f'Subscription already exists: {subscription}')
-        else:
+        if subscription not in self._subscriptions:
             self._subscriptions[subscription] = None
 
     def remove(self, subscription: Subscription) -> None:

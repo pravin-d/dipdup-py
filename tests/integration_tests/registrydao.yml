@@ -7,13 +7,15 @@ database:
 
 contracts:
   registry:
-    address: KT1QMdCTqzmY4QKHntV1nZEinLPU1GbxUFQu
+    address: KT19CF3KKrvdW77ttFomCuin2k4uAVkryYqh
     typename: registry
 
 datasources:
   tzkt:
     kind: tzkt
-    url: ${TZKT_URL:-https://api.edo2net.tzkt.io}
+    url: ${TZKT_URL:-https://api.tzkt.io}
+    http:
+      replay_path: ~/.cache/dipdup/replays
 
 templates:
 
@@ -41,3 +43,5 @@ indexes:
     template: registry_dao
     values:
       contract: registry
+
+logging: quiet

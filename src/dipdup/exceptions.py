@@ -1,22 +1,22 @@
+import tempfile
 import textwrap
-import traceback
-from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 from typing import Dict
-from typing import Iterator
 from typing import Optional
 from typing import Type
 
-import sentry_sdk
+import orjson as json
 from tabulate import tabulate
 from tortoise.models import Model
 
 from dipdup import spec_version_mapping
 from dipdup.enums import ReindexingReason
 
-_tab = '\n\n' + ('_' * 80) + '\n\n'
+tab = ('_' * 80) + '\n\n'
 
 
 def unindent(text: str) -> str:
@@ -29,10 +29,39 @@ def indent(text: str, indent: int = 2) -> str:
     return textwrap.indent(text, ' ' * indent)
 
 
+def save_crashdump(error: Exception) -> str:
+    """Saves a crashdump file with Sentry error data, returns the path to the tempfile"""
+    # NOTE: Lazy import to speed up startup
+    import sentry_sdk.serializer
+    import sentry_sdk.utils
+
+    exc_info = sentry_sdk.utils.exc_info_from_error(error)
+    event, _ = sentry_sdk.utils.event_from_exception(exc_info)
+    event = sentry_sdk.serializer.serialize(event)
+
+    tmp_dir = Path(tempfile.gettempdir()) / 'dipdup' / 'crashdumps'
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    crashdump_file = NamedTemporaryFile(
+        mode='ab',
+        suffix='.json',
+        dir=tmp_dir,
+        delete=False,
+    )
+    with crashdump_file as f:
+        f.write(
+            json.dumps(
+                event,
+                option=json.OPT_INDENT_2,
+            ),
+        )
+    return crashdump_file.name
+
+
 class DipDupException(Exception):
     message: str
 
-    def __init__(self, *args) -> None:
+    def __init__(self, *args: Any) -> None:
         super().__init__(self.message, *args)
 
 
@@ -40,42 +69,30 @@ class ConfigInitializationException(DipDupException):
     message = 'Config is not initialized. Some stage was skipped. Call `pre_initialize` or `initialize`.'
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class DipDupError(Exception):
     """Unknown DipDup error"""
 
-    def __repr__(self) -> str:
-        return f'{self.__class__.__name__}: {self.__doc__}'
+    def __str__(self) -> str:
+        if not self.__doc__:
+            raise NotImplementedError(f'{self.__class__.__name__} has no docstring')
+        return self.__doc__
 
     def _help(self) -> str:
         return """
-            Unexpected error occurred!
+            An unexpected error has occurred!
 
-            Please file a bug report at https://github.com/dipdup-net/dipdup/issues and attach the following:
-
-              * `dipdup.yml` config. Make sure to remove sensitive information.
-              * Reasonable amount of logs before the crash.
+            Please file a bug report at https://github.com/dipdup-net/dipdup/issues
         """
 
     def help(self) -> str:
         return unindent(self._help())
 
     def format(self) -> str:
-        exc = f'\n\n{traceback.format_exc()}'.rstrip()
-        return _tab.join([exc, self.help() + '\n'])
-
-    @contextmanager
-    def wrap(ctx: Optional[Any] = None) -> Iterator[None]:
-        try:
-            yield
-        except DipDupError:
-            raise
-        except Exception as e:
-            sentry_sdk.capture_exception(e)
-            raise DipDupError from e
+        return tab + self.help() + '\n'
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class DatasourceError(DipDupError):
     """One of datasources returned an error"""
 
@@ -86,11 +103,28 @@ class DatasourceError(DipDupError):
         return f"""
             `{self.datasource}` datasource returned an error: {self.msg}
 
-            Most likely, this is a DipDup bug. Please file a bug report at https://github.com/dipdup-net/dipdup/issues
+            Please file a bug report at https://github.com/dipdup-net/dipdup/issues
         """
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
+class InvalidRequestError(DipDupError):
+    """API returned an unexpected response"""
+
+    msg: str
+    url: str
+
+    def _help(self) -> str:
+        return f"""
+            Unexpected response: {self.msg}
+
+            URL: `{self.url}`
+
+            Make sure that config is correct and you're calling the correct API.
+        """
+
+
+@dataclass(repr=False)
 class ConfigurationError(DipDupError):
     """DipDup YAML config is invalid"""
 
@@ -100,29 +134,32 @@ class ConfigurationError(DipDupError):
         return f"""
             {self.msg}
 
-            DipDup config reference: https://docs.dipdup.net/config-file-reference
+            DipDup config reference: https://docs.dipdup.io/config
         """
 
 
-@dataclass(frozen=True, repr=False)
-class DatabaseConfigurationError(ConfigurationError):
-    """DipDup can't initialize database with given models and parameters"""
+@dataclass(repr=False)
+class InvalidModelsError(ConfigurationError):
+    """Can't initialize database, `models.py` module is invalid"""
 
     model: Type[Model]
+    field: Optional[str] = None
 
     def _help(self) -> str:
         return f"""
             {self.msg}
 
-            Model: `{self.model.__class__.__name__}`
-            Table: `{self.model._meta.db_table}`
+              model: `{self.model._meta._model.__name__}`
+              table: `{self.model._meta.db_table}`
+              field: `{self.field or ''}`
 
-            Tortoise ORM examples: https://tortoise-orm.readthedocs.io/en/latest/examples.html
-            DipDup config reference: https://docs.dipdup.net/config-file-reference/database
+            See https://docs.dipdup.io/getting-started/defining-models
+            See https://docs.dipdup.io/config/database
+            See https://docs.dipdup.io/advanced/internal-models
         """
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class MigrationRequiredError(DipDupError):
     """Project and DipDup spec versions don't match"""
 
@@ -138,20 +175,22 @@ class MigrationRequiredError(DipDupError):
             ],
             headers=['', 'spec_version', 'DipDup version'],
         )
-        reindex = _tab + ReindexingRequiredError(ReindexingReason.MIGRATION).help() if self.reindex else ''
+        reindex = '\n\n' + tab + ReindexingRequiredError(ReindexingReason.migration).help() if self.reindex else ''
         return f"""
             Project migration required!
 
             {version_table.strip()}
 
-              1. Run `dipdup migrate`
-              2. Review and commit changes
+            Perform the following actions:
 
-            See https://baking-bad.org/blog/ for additional release information. {reindex}
+              1. Run `dipdup migrate`.
+              2. Review and commit changes.
+
+            See https://docs.dipdup.io/release-notes for more information. {reindex}
         """
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class ReindexingRequiredError(DipDupError):
     """Unable to continue indexing with existing database"""
 
@@ -159,37 +198,47 @@ class ReindexingRequiredError(DipDupError):
     context: Dict[str, Any] = field(default_factory=dict)
 
     def _help(self) -> str:
-        additional_context = '\n              '.join(f'{k}: {v}' for k, v in self.context.items())
-        return f"""
-            Reindexing required!
+        # FIXME: Indentation hell
+        prefix = '\n' + ' ' * 14
+        context = prefix.join(f'{k}: {v}' for k, v in self.context.items())
+        if context:
+            context = '{prefix}{context}\n'.format(prefix=prefix, context=context)
 
-            Reason: {self.reason.value}
-
-            Additional context:
-
-                {additional_context}
-
+        return """
+            Reindexing required! Reason: {reason}.
+              {context}
             You may want to backup database before proceeding. After that perform one of the following actions:
 
-                * Eliminate the cause of reindexing and run `dipdup schema approve`.
-                * Drop database and start indexing from scratch with `dipdup schema wipe` command.
-        """
+              * Eliminate the cause of reindexing and run `dipdup schema approve`.
+              * Drop database and start indexing from scratch with `dipdup schema wipe` command.
+
+            See https://docs.dipdup.io/advanced/reindexing for more information.
+        """.format(
+            reason=self.reason.value,
+            context=context,
+        )
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class InitializationRequiredError(DipDupError):
-    def _help(self) -> str:
-        return """
-            Project initialization required!
+    """Project initialization required"""
 
-            1. Run `dipdup init`
-            2. Review and commit changes
+    message: str
+
+    def _help(self) -> str:
+        return f"""
+            Project initialization required! Reason: {self.message}.
+
+            Perform the following actions:
+
+              * Run `dipdup init`.
+              * Review and commit changes.
         """
 
 
-@dataclass(frozen=True, repr=False)
-class HandlerImportError(DipDupError):
-    """Can't perform import from handler module"""
+@dataclass(repr=False)
+class ProjectImportError(DipDupError):
+    """Can't import type or callback from the project package"""
 
     module: str
     obj: Optional[str] = None
@@ -197,21 +246,20 @@ class HandlerImportError(DipDupError):
     def _help(self) -> str:
         what = f'`{self.obj}` from ' if self.obj else ''
         return f"""
-            Failed to import {what} module `{self.module}`.
+            Failed to import {what}module `{self.module}`.
 
             Reasons in order of possibility:
 
-            1. `init` command was not called after modifying config
-            2. Name of handler module and handler function inside it don't match
-            2. Invalid `package` config value, reusing name of existing package
-            3. Something's wrong with PYTHONPATH env variable
-
+              1. `init` command has not been called after modifying the config
+              2. Type or callback has been renamed or removed manually
+              3. `package` name is occupied by existing non-DipDup package
+              4. Package exists, but not discoverable - check `$PYTHONPATH`
         """
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class ContractAlreadyExistsError(DipDupError):
-    """Attemp to add a contract with alias or address which is already in use"""
+    """Attempt to add a contract with alias or address already in use"""
 
     ctx: Any
     name: str
@@ -225,7 +273,7 @@ class ContractAlreadyExistsError(DipDupError):
             )
         )
         return f"""
-            Contract with name `{self.name}` or address `{self.address}` already exists.
+            Contract `{self.name}` (`{self.address}`) already exists.
 
             Active contracts:
 
@@ -233,14 +281,14 @@ class ContractAlreadyExistsError(DipDupError):
         """
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class IndexAlreadyExistsError(DipDupError):
-    """Attemp to add an index with alias which is already in use"""
+    """Attempt to add an index with an alias already in use"""
 
     ctx: Any
     name: str
 
-    def format_help(self) -> str:
+    def _help(self) -> str:
         indexes_table = indent(
             tabulate(
                 [(c.name, c.kind) for c in self.ctx.config.indexes.values()],
@@ -256,44 +304,44 @@ class IndexAlreadyExistsError(DipDupError):
         """
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class InvalidDataError(DipDupError):
     """Failed to validate datasource message against generated type class"""
 
-    type_cls: Type
+    msg: str
+    type_: Type[Any]
     data: Any
-    parsed_object: Any
 
     def _help(self) -> str:
 
         return f"""
             Failed to validate datasource message against generated type class.
 
-            Expected type:
-            `{self.type_cls.__class__.__qualname__}`
+              {self.msg}
 
-            Invalid data:
-            {self.data}
-
-            Parsed object:
-            {self.parsed_object}
+            Type class: `{self.type_.__name__}`
+            Data: `{self.data}`
         """
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class CallbackError(DipDupError):
     """An error occured during callback execution"""
 
-    kind: str
-    name: str
+    module: str
+    exc: Exception
 
     def _help(self) -> str:
         return f"""
-            `{self.name}` {self.kind} callback execution failed.
+            `{self.module}` callback execution failed:
+
+              {self.exc.__class__.__name__}: {self.exc}
+            
+            Eliminate the reason of failure and restart DipDup.
         """
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(repr=False)
 class CallbackTypeError(DipDupError):
     """Agrument of invalid type was passed to a callback"""
 
@@ -301,8 +349,8 @@ class CallbackTypeError(DipDupError):
     name: str
 
     arg: str
-    type_: Type
-    expected_type: Type
+    type_: Type[Any]
+    expected_type: Type[Any]
 
     def _help(self) -> str:
         return f"""
@@ -313,23 +361,45 @@ class CallbackTypeError(DipDupError):
               expected type: {self.expected_type}
 
             Make sure to set correct typenames in config and run `dipdup init --overwrite-types` to regenerate typeclasses.
+
+            See https://docs.dipdup.io/getting-started/project-structure
+            See https://docs.dipdup.io/cli-reference#init
         """
 
 
-@dataclass(frozen=True, repr=False)
-class DeprecatedHandlerError(DipDupError):
-    """Default handlers need to be converted to hooks"""
+@dataclass(repr=False)
+class HasuraError(DipDupError):
+    """Failed to configure Hasura instance"""
+
+    msg: str
 
     def _help(self) -> str:
-        return """
-            Default handlers have been deprecated in favor of hooks in DipDup 3.0.
+        return f"""
+            Failed to configure Hasura:
 
-              * `handlers/on_rollback.py` -> `hooks/on_rollback.py`
-              * `handlers/on_configure.py` -> `hooks/on_restart.py`
-              * [none] -> `hooks/on_reindex.py`
+              {self.msg}
 
-            Perform the following actions:
+            If it's `400 Bad Request`, check out Hasura logs for more information.
 
-              1. If you have any custom logic implemented in default handlers move it to corresponding hooks from the table above.
-              2. Remove default handlers from project.
+            See https://docs.dipdup.io/graphql/
+            See https://docs.dipdup.io/config/hasura
+            See https://docs.dipdup.io/cli-reference#dipdup-hasura-configure
+        """
+
+
+@dataclass(repr=False)
+class FeatureAvailabilityError(DipDupError):
+    """Requested feature is not supported in the current environment"""
+
+    feature: str
+    reason: str
+
+    def _help(self) -> str:
+        return f"""
+            Feature `{self.feature}` is not available in the current environment.
+
+            {self.reason}
+
+            See https://docs.dipdup.io/installation
+            See https://docs.dipdup.io/advanced/docker
         """

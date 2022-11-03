@@ -1,14 +1,12 @@
 import asyncio
 import hashlib
 import importlib
-import json
 import logging
 import re
 from contextlib import suppress
 from http import HTTPStatus
 from json import dumps as dump_json
-from os.path import dirname
-from os.path import join
+from pathlib import Path
 from typing import Any
 from typing import Dict
 from typing import Iterable
@@ -16,26 +14,36 @@ from typing import Iterator
 from typing import List
 from typing import Optional
 from typing import Tuple
+from typing import Union
+from typing import cast
 
-import humps  # type: ignore
+import orjson as json
 from aiohttp import ClientConnectorError
 from aiohttp import ClientOSError
+from aiohttp import ClientResponseError
 from aiohttp import ServerDisconnectedError
+from humps import main as humps
 from pydantic.dataclasses import dataclass
 from tortoise import fields
-from tortoise.transactions import get_connection
 
+from dipdup.config import DEFAULT_POSTGRES_SCHEMA
 from dipdup.config import HasuraConfig
 from dipdup.config import HTTPConfig
 from dipdup.config import PostgresDatabaseConfig
 from dipdup.exceptions import ConfigurationError
+from dipdup.exceptions import HasuraError
 from dipdup.http import HTTPGateway
 from dipdup.models import Schema
 from dipdup.utils import iter_files
 from dipdup.utils import pascal_to_snake
+from dipdup.utils.database import get_connection
 from dipdup.utils.database import iter_models
 
-_get_fields_query = '''
+RelationalFieldT = Union[
+    fields.relational.ForeignKeyFieldInstance,
+    fields.relational.ManyToManyFieldInstance,
+]
+_get_fields_query = """
 query introspectionQuery($name: String!) {
   __type(name: $name) {
     kind
@@ -54,7 +62,7 @@ query introspectionQuery($name: String!) {
     }
   }
 }
-'''.replace(
+""".replace(
     '\n', ' '
 ).replace(
     '  ', ''
@@ -77,13 +85,8 @@ class Field:
         return humps.decamelize(self.name)
 
 
-class HasuraError(RuntimeError):
-    ...
-
-
 class HasuraGateway(HTTPGateway):
     _default_http_config = HTTPConfig(
-        cache=False,
         # NOTE: Does not apply to initial healthcheck
         retry_count=3,
         retry_sleep=1,
@@ -102,10 +105,10 @@ class HasuraGateway(HTTPGateway):
         self._hasura_config = hasura_config
         self._database_config = database_config
 
-    async def configure(self) -> None:
+    async def configure(self, force: bool = False) -> None:
         """Generate Hasura metadata and apply to instance with credentials from `hasura` config section."""
-
-        if self._database_config.schema_name != 'public':
+        # TODO: Validate during config parsing
+        if self._database_config.schema_name != DEFAULT_POSTGRES_SCHEMA:
             raise ConfigurationError('Hasura integration requires `schema_name` to be `public`')
 
         self._logger.info('Configuring Hasura')
@@ -116,31 +119,45 @@ class HasuraGateway(HTTPGateway):
         metadata = await self._fetch_metadata()
         metadata_hash = self._hash_metadata(metadata)
 
-        if hasura_schema.hash == metadata_hash:
+        if not force and hasura_schema.hash == metadata_hash:
             self._logger.info('Metadata is up to date, no action required')
             return
 
-        await self._reset_metadata()
-        metadata = await self._fetch_metadata()
+        # NOTE: Find chosen source and overwrite its tables, create if missing and allowed.
+        source_name = self._hasura_config.source
 
-        # NOTE: Hasura metadata updated in three steps.
-        # NOTE: Order matters because queries must be generated after applying table customization to be valid.
-        # NOTE: 1. Generate and apply tables metadata.
-        source_tables_metadata = await self._generate_source_tables_metadata()
-        metadata['sources'][0]['tables'] = source_tables_metadata
+        if (source := self._get_source(metadata, source_name)) is None:
+            if not self._hasura_config.create_source:
+                raise HasuraError(
+                    f'Source `{source_name}` not found in metadata. Set `create_source` flag to create it.'
+                )
+
+            await self._create_source()
+            metadata = await self._fetch_metadata()
+            if (source := self._get_source(metadata, source_name)) is None:
+                raise HasuraError(f'Source `{source_name}` not found in metadata after creation.')
+
+        source['tables'] = await self._generate_source_tables_metadata()
+
+        # NOTE: Don't forget to invalidate old queries, customization will fail otherwise.
+        metadata['query_collections'] = []
+        metadata['rest_endpoints'] = []
+
         await self._replace_metadata(metadata)
 
-        # NOTE: 2. Apply table customization and refresh metadata
-        await self._apply_table_customization()
+        # NOTE: Apply table customizations before generating queries
+        await self._apply_table_customization(source)
         metadata = await self._fetch_metadata()
+        if (source := self._get_source(metadata, source_name)) is None:
+            raise HasuraError(f'Source `{source_name}` not found in metadata after table customization.')
 
-        # NOTE: 3. Generate and apply queries and rest endpoints
+        # NOTE: Generate and apply queries and REST endpoints
         query_collections_metadata = await self._generate_query_collections_metadata()
         self._logger.info('Adding %s generated and user-defined queries', len(query_collections_metadata))
         metadata['query_collections'] = [
             {
-                "name": "allowed-queries",
-                "definition": {"queries": query_collections_metadata},
+                'name': 'allowed-queries',
+                'definition': {'queries': query_collections_metadata},
             }
         ]
 
@@ -152,25 +169,38 @@ class HasuraGateway(HTTPGateway):
 
         await self._replace_metadata(metadata)
 
+        # TODO: Find out why it is necessary
+        # NOTE: Fetch metadata once again and save its hash for future comparisons
         metadata = await self._fetch_metadata()
         metadata_hash = self._hash_metadata(metadata)
-        hasura_schema.hash = metadata_hash  # type: ignore
+        hasura_schema.hash = metadata_hash
         await hasura_schema.save()
 
         self._logger.info('Hasura instance has been configured')
 
+    def _get_source(self, metadata: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+        for source in metadata['sources']:
+            if source['name'] == name:
+                return source
+        else:
+            return None
+
     async def _hasura_request(self, endpoint: str, json: Dict[str, Any]) -> Dict[str, Any]:
         self._logger.debug('Sending `%s` request: %s', endpoint, dump_json(json))
-        result = await self._http.request(
-            method='post',
-            cache=False,
-            url=f'{self._hasura_config.url}/v1/{endpoint}',
-            json=json,
-            headers=self._hasura_config.headers,
-        )
+        try:
+            result = await self.request(
+                method='post',
+                url=f'{self._hasura_config.url}/v1/{endpoint}',
+                json=json,
+                headers=self._hasura_config.headers,
+            )
+        except ClientResponseError as e:
+            raise HasuraError(f'{e.status} {e.message}') from e
+
         self._logger.debug('Response: %s', result)
-        if 'error' in result or 'errors' in result:
-            raise HasuraError('Can\'t configure Hasura instance', result)
+        if errors := result.get('error') or result.get('errors'):
+            raise HasuraError(errors)
+
         return result
 
     async def _healthcheck(self) -> None:
@@ -183,7 +213,7 @@ class HasuraGateway(HTTPGateway):
                     break
             await asyncio.sleep(1)
         else:
-            raise HasuraError(f'Hasura instance not responding for {timeout} seconds')
+            raise HasuraError(f'Not responding for {timeout} seconds')
 
         version_json = await (
             await self._http._session.get(
@@ -192,17 +222,28 @@ class HasuraGateway(HTTPGateway):
         ).json()
         version = version_json['version']
         if version.startswith('v1'):
-            raise HasuraError('Hasura v1 is not supported.')
+            raise HasuraError('v1 is not supported, upgrade to the latest stable version.')
 
         self._logger.info('Connected to Hasura %s', version)
 
-    async def _reset_metadata(self) -> None:
-        self._logger.info('Resetting metadata')
-        await self._hasura_request(
+    async def _create_source(self) -> Dict[str, Any]:
+        self._logger.info(f'Adding source `{self._hasura_config.source}`')
+        return await self._hasura_request(
             endpoint='metadata',
             json={
-                "type": "clear_metadata",
-                "args": {},
+                'type': 'pg_add_source',
+                'args': {
+                    'name': self._hasura_config.source,
+                    'configuration': {
+                        'connection_info': {
+                            'database_url': {
+                                'connection_parameters': self._database_config.hasura_connection_parameters,
+                            },
+                            'use_prepared_statements': True,
+                        }
+                    },
+                    'replace_configuration': True,
+                },
             },
         )
 
@@ -211,27 +252,30 @@ class HasuraGateway(HTTPGateway):
         return await self._hasura_request(
             endpoint='metadata',
             json={
-                "type": "export_metadata",
-                "args": {},
+                'type': 'export_metadata',
+                'args': {},
             },
         )
 
     def _hash_metadata(self, metadata: Dict[str, Any]) -> str:
-        return hashlib.sha256(json.dumps(metadata).encode()).hexdigest()
+        return hashlib.sha256(json.dumps(metadata)).hexdigest()
 
     async def _replace_metadata(self, metadata: Dict[str, Any]) -> None:
         self._logger.info('Replacing metadata')
         endpoint, json = 'query', {
-            "type": "replace_metadata",
-            "args": metadata,
+            'type': 'replace_metadata',
+            'args': {
+                'metadata': metadata,
+            },
         }
         await self._hasura_request(endpoint, json)
 
     async def _get_views(self) -> List[str]:
+        conn = get_connection()
         views = [
             row[0]
             for row in (
-                await get_connection(None).execute_query(
+                await conn.execute_query(
                     f"SELECT table_name FROM information_schema.views WHERE table_schema = '{self._database_config.schema_name}' UNION "
                     f"SELECT matviewname as table_name FROM pg_matviews WHERE schemaname = '{self._database_config.schema_name}'"
                 )
@@ -242,8 +286,7 @@ class HasuraGateway(HTTPGateway):
 
     def _iterate_graphql_queries(self) -> Iterator[Tuple[str, str]]:
         package = importlib.import_module(self._package)
-        package_path = dirname(package.__file__)
-        graphql_path = join(package_path, 'graphql')
+        graphql_path = Path(cast(str, package.__file__)) / 'graphql'
         for file in iter_files(graphql_path, '.graphql'):
             yield file.name.split('/')[-1][:-8], file.read()
 
@@ -272,22 +315,51 @@ class HasuraGateway(HTTPGateway):
 
             for field in model._meta.fields_map.values():
                 if isinstance(field, fields.relational.ForeignKeyFieldInstance):
-                    if not isinstance(field.related_name, str):
-                        raise HasuraError(f'`related_name` of `{field}` must be set')
                     related_table_name = model_tables[field.model_name]
+                    field_name = field.model_field_name
                     metadata_tables[table_name]['object_relationships'].append(
                         self._format_object_relationship(
-                            name=field.model_field_name,
-                            column=field.model_field_name + '_id',
+                            name=field_name,
+                            column=self._get_relation_source_field(field),
                         )
                     )
-                    metadata_tables[related_table_name]['array_relationships'].append(
-                        self._format_array_relationship(
-                            related_name=field.related_name,
-                            table=table_name,
-                            column=field.model_field_name + '_id',
+                    if field.related_name:
+                        metadata_tables[related_table_name]['array_relationships'].append(
+                            self._format_array_relationship(
+                                related_name=field.related_name,
+                                table=table_name,
+                                column=self._get_relation_source_field(field),
+                            )
+                        )
+
+                elif isinstance(field, fields.relational.ManyToManyFieldInstance):
+                    related_table_name = model_tables[field.model_name]
+                    junction_table_name = field.through
+
+                    metadata_tables[junction_table_name] = self._format_table(junction_table_name)
+                    metadata_tables[junction_table_name]['object_relationships'].append(
+                        self._format_object_relationship(
+                            name=related_table_name,
+                            column=field.forward_key,
                         )
                     )
+                    metadata_tables[junction_table_name]['object_relationships'].append(
+                        self._format_object_relationship(
+                            name=table_name,
+                            column=field.backward_key,
+                        )
+                    )
+                    if field.related_name:
+                        metadata_tables[related_table_name]['array_relationships'].append(
+                            self._format_array_relationship(
+                                related_name=f'{related_table_name}_{field.related_name}',
+                                table=junction_table_name,
+                                column=field.forward_key,
+                            )
+                        )
+
+                else:
+                    pass
 
         return list(metadata_tables.values())
 
@@ -304,10 +376,20 @@ class HasuraGateway(HTTPGateway):
                 raise RuntimeError(f'Table `{table_name}` has no primary key. How is that possible?')
 
             fields = await self._get_fields(table_name)
-            queries.append(self._format_rest_query(table_name, table_name, filter, fields))
+            queries.append(
+                self._format_rest_query(
+                    name=table_name,
+                    table=table_name,
+                    filter=filter,
+                    fields=fields,
+                )
+            )
 
         for query_name, query in self._iterate_graphql_queries():
-            queries.append(dict(name=query_name, query=query))
+            queries.append({'name': query_name, 'query': query})
+
+        # NOTE: This is the only view we add by ourselves and thus know all params. Won't work for any view.
+        queries.append(self._format_rest_head_status_query())
 
         return queries
 
@@ -339,14 +421,14 @@ class HasuraGateway(HTTPGateway):
             # NOTE: An issue with decamelizing the table name?
             # NOTE: dex_quotes_15m -> dexQuotes15m -> dex_quotes15m -> FAIL
             # NOTE: Let's prefix every numeric with underscore. Won't help in complex cases but worth a try.
-            alternative_name = ''.join([f"_{w}" if w.isnumeric() else w for w in re.split(r'(\d+)', name)])
+            alternative_name = ''.join([f'_{w}' if w.isnumeric() else w for w in re.split(r'(\d+)', name)])
             fields_json = await self._get_fields_json(alternative_name)
 
         fields = []
         for field_json in fields_json:
             # NOTE: Exclude autogenerated aggregate and pk fields
             ignore_postfixes = ('_aggregate', '_by_pk', 'Aggregate', 'ByPk')
-            if any(map(lambda postfix: field_json['name'].endswith(postfix), ignore_postfixes)):
+            if any(field_json['name'].endswith(p) for p in ignore_postfixes):
                 continue
 
             # NOTE: Exclude relations. Not reliable enough but ok for now.
@@ -367,17 +449,22 @@ class HasuraGateway(HTTPGateway):
 
         return fields
 
-    async def _apply_table_customization(self) -> None:
+    async def _apply_table_customization(self, source: Dict[str, Any]) -> None:
         """Convert table and column names to camelCase.
 
         Based on https://github.com/m-rgba/hasura-snake-to-camel
         """
 
+        # NOTE: Build a set of table names for our source
+        table_names = {t['table']['name'] for t in source['tables']}
         tables = await self._get_fields()
 
         # TODO: Bulk request
         for table in tables:
-            custom_root_fields = self._format_custom_root_fields(table)
+            if table.root not in table_names:
+                continue
+
+            custom_root_fields = self._format_custom_root_fields(table.root)
             columns = await self._get_fields(table.root)
             custom_column_names = self._format_custom_column_names(columns)
             args: Dict[str, Any] = {
@@ -407,7 +494,7 @@ class HasuraGateway(HTTPGateway):
             name = humps.camelize(name)
             filter = humps.camelize(filter)
             table = humps.camelize(table)
-            map(lambda f: f.camelize(), fields)
+            fields = [f.camelize() for f in fields]
 
         try:
             filter_field = next(f for f in fields if f.name == filter)
@@ -419,26 +506,44 @@ class HasuraGateway(HTTPGateway):
         query_fields = ' '.join(f.name for f in fields)
         return {
             'name': name,
-            'query': 'query ' + name + ' (' + query_arg + ') {' + table + '(' + query_filter + ') {' + query_fields + '}}',
+            'query': 'query '
+            + name
+            + ' ('
+            + query_arg
+            + ') {'
+            + table
+            + '('
+            + query_filter
+            + ') {'
+            + query_fields
+            + '}}',
+        }
+
+    def _format_rest_head_status_query(self) -> Dict[str, Any]:
+        name = 'dipdup_head_status'
+        if self._hasura_config.camel_case:
+            name = humps.camelize(name)
+
+        return {
+            'name': name,
+            'query': 'query ' + name + ' ($name: String!) {' + name + '(where: {name: {_eq: $name}}) {status}}',
         }
 
     def _format_rest_endpoint(self, query_name: str) -> Dict[str, Any]:
         return {
-            "definition": {
-                "query": {
-                    "collection_name": "allowed-queries",
-                    "query_name": query_name,
+            'definition': {
+                'query': {
+                    'collection_name': 'allowed-queries',
+                    'query_name': query_name,
                 },
             },
-            "url": query_name,
-            "methods": ["GET", "POST"],
-            "name": query_name,
-            "comment": None,
+            'url': query_name,
+            'methods': ['GET', 'POST'],
+            'name': query_name,
+            'comment': None,
         }
 
-    def _format_custom_root_fields(self, table: Field) -> Dict[str, Any]:
-        table_name = table.root
-
+    def _format_custom_root_fields(self, table_name: str) -> Dict[str, Any]:
         def _fmt(fmt: str) -> str:
             if self._hasura_config.camel_case:
                 return humps.camelize(fmt.format(table_name))
@@ -465,17 +570,17 @@ class HasuraGateway(HTTPGateway):
 
     def _format_table(self, name: str) -> Dict[str, Any]:
         return {
-            "table": self._format_table_table(name),
-            "object_relationships": [],
-            "array_relationships": [],
-            "select_permissions": [
+            'table': self._format_table_table(name),
+            'object_relationships': [],
+            'array_relationships': [],
+            'select_permissions': [
                 self._format_select_permissions(),
             ],
         }
 
     def _format_table_table(self, name: str) -> Dict[str, Any]:
         return {
-            "schema": self._database_config.schema_name,
+            'schema': self._database_config.schema_name,
             'name': name,
         }
 
@@ -486,13 +591,13 @@ class HasuraGateway(HTTPGateway):
         column: str,
     ) -> Dict[str, Any]:
         return {
-            "name": related_name if not self._hasura_config.camel_case else humps.camelize(related_name),
-            "using": {
-                "foreign_key_constraint_on": {
-                    "column": column,
-                    "table": {
-                        "schema": self._database_config.schema_name,
-                        "name": table,
+            'name': related_name if not self._hasura_config.camel_case else humps.camelize(related_name),
+            'using': {
+                'foreign_key_constraint_on': {
+                    'column': column,
+                    'table': {
+                        'schema': self._database_config.schema_name,
+                        'name': table,
                     },
                 },
             },
@@ -500,19 +605,24 @@ class HasuraGateway(HTTPGateway):
 
     def _format_object_relationship(self, name: str, column: str) -> Dict[str, Any]:
         return {
-            "name": name if not self._hasura_config.camel_case else humps.camelize(name),
-            "using": {
-                "foreign_key_constraint_on": column,
+            'name': name if not self._hasura_config.camel_case else humps.camelize(name),
+            'using': {
+                'foreign_key_constraint_on': column,
             },
         }
 
     def _format_select_permissions(self) -> Dict[str, Any]:
         return {
-            "role": "user",
-            "permission": {
-                "columns": "*",
-                "filter": {},
-                "allow_aggregations": self._hasura_config.allow_aggregations,
-                "limit": self._hasura_config.select_limit,
+            'role': 'user',
+            'permission': {
+                'columns': '*',
+                'filter': {},
+                'allow_aggregations': self._hasura_config.allow_aggregations,
+                'limit': self._hasura_config.select_limit,
             },
         }
+
+    def _get_relation_source_field(self, field: RelationalFieldT) -> str:
+        if source_field := field.source_field:
+            return field.model._meta.fields_db_projection[source_field]
+        return field.model_field_name + '_id'

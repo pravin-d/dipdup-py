@@ -23,6 +23,8 @@ datasources:
   tzkt_mainnet:
     kind: tzkt
     url: https://api.tzkt.io
+    http:
+      replay_path: ~/.cache/dipdup/replays
 
 templates:
   quipuswap_fa12:
@@ -171,3 +173,5 @@ indexes:
       token_contract: hdao_token_mainnet
       symbol: hDAO
       decimals: 6
+
+logging: quiet

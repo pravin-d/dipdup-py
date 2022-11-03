@@ -1,20 +1,13 @@
-import asyncio
 import importlib
 import logging
 import pkgutil
-import time
 import types
 from collections import defaultdict
-from contextlib import asynccontextmanager
-from functools import partial
+from contextlib import suppress
+from decimal import Decimal
 from functools import reduce
 from logging import Logger
-from os import listdir
-from os import makedirs
-from os.path import dirname
-from os.path import exists
-from os.path import getsize
-from os.path import join
+from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import DefaultDict
@@ -25,14 +18,12 @@ from typing import Optional
 from typing import Sequence
 from typing import TextIO
 from typing import TypeVar
+from typing import cast
 
-import humps  # type: ignore
-from genericpath import isdir
-from genericpath import isfile
+import orjson
+from humps import main as humps
 
-from dipdup.exceptions import HandlerImportError
-
-_logger = logging.getLogger('dipdup.utils')
+from dipdup.exceptions import ProjectImportError
 
 
 def import_submodules(package: str) -> Dict[str, types.ModuleType]:
@@ -46,25 +37,23 @@ def import_submodules(package: str) -> Dict[str, types.ModuleType]:
     return results
 
 
-@asynccontextmanager
-async def slowdown(seconds: int):
-    """Sleep if nested block was executed faster than X seconds"""
-    started_at = time.time()
-    yield
-    finished_at = time.time()
-    time_spent = finished_at - started_at
-    if time_spent < seconds:
-        await asyncio.sleep(seconds - time_spent)
-
-
 def snake_to_pascal(value: str) -> str:
     """humps wrapper for Python imports"""
-    return humps.pascalize(value.replace('.', '_'))
+    value = value.replace('.', '_')
+    # NOTE: Special case, humps returns uppercase otherwise
+    if value.isupper():
+        value = value.lower()
+    return cast(str, humps.pascalize(value))
 
 
-def pascal_to_snake(value: str) -> str:
+def pascal_to_snake(value: str, strip_dots: bool = True) -> str:
     """humps wrapper for Python imports"""
-    return humps.depascalize(value.replace('.', '_')).replace('__', '_')
+    if strip_dots:
+        value = value.replace('.', '_')
+    # NOTE: Special case, humps returns uppercase otherwise
+    if value.isupper():
+        value = value.lower()
+    return humps.depascalize(value).replace('__', '_')
 
 
 def split_by_chunks(input_: List[Any], size: int) -> Iterator[List[Any]]:
@@ -94,76 +83,67 @@ class FormattedLogger(Logger):
         self.logger = logging.getLogger(name)
         self.fmt = fmt
 
-    def __getattr__(self, name: str) -> Callable:
+    def __getattr__(self, name: str) -> Any:
         if name == '_log':
             return self._log
         return getattr(self.logger, name)
 
-    def _log(self, level, msg, args, exc_info=None, extra=None, stack_info=False, stacklevel=1):
+    def _log(self, level, msg, args, exc_info=None, extra=None, stack_info=False, stacklevel=1) -> None:
         if self.fmt:
             msg = self.fmt.format(msg)
         self.logger._log(level, msg, args, exc_info, extra, stack_info, stacklevel)
 
 
-# TODO: Cache me
-def iter_files(path: str, ext: Optional[str] = None) -> Iterator[TextIO]:
+def iter_files(path: Path, ext: Optional[str] = None) -> Iterator[TextIO]:
     """Iterate over files in a directory. Or a single file. Sort alphabetically, filter by extension, skip empty files."""
-    if not exists(path):
+    if not path.exists():
         return
-    elif isfile(path):
-        paths = iter(path)
-    elif isdir(path):
-        paths = map(partial(join, path), sorted(listdir(path)))
+    elif path.is_file():
+        paths = [path]
+    elif path.is_dir():
+        paths = list(path.glob('**/*'))
     else:
         raise RuntimeError(f'Path `{path}` exists but is neither a file nor a directory')
 
     for path in paths:
-        if ext and not path.endswith(ext):
+        if ext and path.suffix != ext:
             continue
-        if not exists(path):
+        if not path.exists():
             continue
-        if not getsize(path):
+        if not path.stat().st_size:
             continue
         with open(path) as file:
             yield file
 
 
-def mkdir_p(path: str) -> None:
-    """Create directory tree, ignore if already exists"""
-    if not exists(path):
-        _logger.info('Creating directory `%s`', path)
-        makedirs(path)
-
-
-def touch(path: str) -> None:
-    """Create empty file, ignore if already exists"""
-    mkdir_p(dirname(path))
-    if not exists(path):
-        _logger.info('Creating file `%s`', path)
-        open(path, 'a').close()
-
-
-def write(path: str, content: str, overwrite: bool = False) -> bool:
-    """Write content to file, create directory tree if necessary"""
-    mkdir_p(dirname(path))
-    if exists(path) and not overwrite:
-        return False
-    _logger.info('Writing into file `%s`', path)
-    with open(path, 'w') as file:
-        file.write(content)
-    return True
-
-
 def import_from(module: str, obj: str) -> Any:
-    """Import object from module, raise HandlerImportError on failure"""
+    """Import object from module, raise ProjectImportError on failure"""
     try:
         return getattr(importlib.import_module(module), obj)
     except (ImportError, AttributeError) as e:
-        raise HandlerImportError(module, obj) from e
+        raise ProjectImportError(module, obj) from e
 
 
-def remove_prefix(text: str, prefix: str) -> str:
-    """Remove prefix and strip underscores"""
-    if text.startswith(prefix):
-        text = text[len(prefix) :]
-    return text.strip('_')
+def is_importable(module: str, obj: str) -> bool:
+    """Check if object can be imported from module"""
+    with suppress(ProjectImportError):
+        import_from(module, obj)
+        return True
+    return False
+
+
+def exclude_none(config_json: Any) -> Any:
+    if isinstance(config_json, (list, tuple)):
+        return [exclude_none(i) for i in config_json if i is not None]
+    if isinstance(config_json, dict):
+        return {k: exclude_none(v) for k, v in config_json.items() if v is not None}
+    return config_json
+
+
+def json_dumps_decimals(obj):
+    def _default(obj):
+        if isinstance(obj, Decimal):
+            return str(obj)
+        raise TypeError
+
+    return orjson.dumps(obj, default=_default).decode()
